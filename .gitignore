@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 執行期資料：PDF、索引、快取、學習資料、模型
+data/
+models/
+*.pdf
+*.PDF
+.claude/

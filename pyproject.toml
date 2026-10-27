@@ -1,0 +1,23 @@
+[project]
+name = "iso-rag"
+version = "0.1.0"
+description = "ISO 文件問答 RAG 展示專案：自適應 OCR、混合檢索與附出處的 LLM 回答"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.11.0",
+    "httpx>=0.28.1",
+    "huggingface-hub>=1.33.0",
+    "numpy>=2.5.3",
+    "onnxruntime>=1.30.0",
+    "opencc-python-reimplemented>=0.1.7",
+    "pypdfium2>=5.14.0",
+    "python-dotenv>=1.2.4",
+    "rapidocr>=3.9.2",
+    "tokenizers>=0.23.2",
+    "truststore>=0.10.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
