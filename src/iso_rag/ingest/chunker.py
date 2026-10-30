@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from ..index import textnorm
+
 MIN_CHARS = 120
 MAX_CHARS = 700
 
@@ -74,15 +76,29 @@ def _is_heading(line: str) -> tuple[str, str] | None:
     # 「1次/96小時」「2022/8/30」之類不是標題：編號後面緊接的不能是數字/單位/斜線
     if re.match(r"^[\d/%:.\-]", title) or len(num) > 11:
         return None
-    # ISO 文件的第一層章節不會超過 20（目的/範圍/權責/定義/作業內容…）；
-    # 「50元/月」「120 天」這種表格內容不是標題
-    if int(num.split(".")[0]) > 20 or re.match(r"^[元天日月年時小分個件次%％]", title):
+    # ISO 文件的第一層章節不會超過 20（目的/範圍/權責/定義/作業內容…）
+    if int(num.split(".")[0]) > 20:
+        return None
+    # 「50元/月」「120 天」這種表格內容不是標題；但子條文「3.5 次要缺點」「4.2 天然災害」是：
+    # 單位字後面接中文詞（不是「小時」），而且不像表格列（沒有日期、沒有「|」）
+    unit = re.match(r"^[元天日月年時小分個件次%％]", title)
+    if unit and not ("." in num and unit.group(0) != "小" and re.match(f"^.[{textnorm.CJK}]", title)
+                     and not re.search(r"\d{4}/\d|\|", title)):
         return None
     if "." not in num and not line.strip()[len(num):].lstrip().startswith((".", "、", "．")):
         # 「1 目的」也算，但「12 2019/04/24 ...」這種表格列不算
         if len(title) > 25 or re.search(r"\d{4}/\d", title):
             return None
+    # 表格列（「|」分格）有一格是日期 -> 是一筆紀錄，不是條文標題：修訂履歷「1.3 | 增加品質目標 | 1 | 品保部 |
+    # NOV-18-2009」的版次會被誤認成條號，切段與後面真正的「一.目的」都會亂掉。排成表格的真條文沒有日期格
+    if any(_DATE_CELL_RE.match(cell) for cell in re.split(r"\s*[|｜]\s*", title)[1:]):
+        return None
     return num, title
+
+
+# 一格的開頭是日期：2018/05/05、2011-01、JUL-01-2006、JULY-18-2022、JUN.27,2014
+_DATE_CELL_RE = re.compile(r"\d{4}\s*[/.\-年]\s*\d{1,2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}(?!\d)"
+                           r"|[A-Za-z]{3,9}[.\-\s]?\d{1,2}[,.\-\s]+\d{4}")
 
 
 class HeadingSeq:
@@ -91,6 +107,7 @@ class HeadingSeq:
 
     def __init__(self, start_top: int = 0):
         self.top = start_top
+        self.seen = 0
 
     def accept(self, h: tuple[str, str] | None) -> tuple[str, str] | None:
         if not h:
@@ -100,16 +117,32 @@ class HeadingSeq:
         # 表格列「5 製程條件記錄表 5. 客戶特殊要求項」很長 -> 不是標題
         if "." not in h[0] and len(h[1].strip()) > 12:
             return None
-        if self.top and not (self.top <= t <= self.top + 2):
+        # 只認過一個標題就遇到第 1 章：OCR 的版面順序把別章排到前面了，從第 1 章重新起頭。
+        # 限定標題很短（「目的」），避免後面清單的「1. 課級及以上主管」被當成重新起頭
+        restart = self.seen <= 1 and h[0] == "1" and len(h[1].strip(" :：.．、")) <= 4
+        if self.top and not (self.top <= t <= self.top + 2) and not restart:
             return None
         # 第一個標題不限從 1 開始：有些 PDF 只掃了後半（從「5.作業內容」開始），前面幾頁不在檔案裡
         self.top = t
+        self.seen += 1
         return h
 
 
 def headings_in(text: str, start_clause: str = "") -> list[str]:
     seq = HeadingSeq(int(start_clause.split(".")[0]) if start_clause[:1].isdigit() else 0)
     return [h[0] for ln in text.splitlines() if (h := seq.accept(_is_heading(ln)))]
+
+
+def clause_blocks(text: str, start_clause: str = "") -> list[tuple[str, str, str]]:
+    """段落依條文標題（各層）切開：[(條號, 標題, 文字)]；第一個標題前的行算 start_clause（標題空白）。"""
+    seq = HeadingSeq(int(start_clause.split(".")[0]) if start_clause[:1].isdigit() else 0)
+    out: list[list] = [[start_clause, "", []]]
+    for ln in text.splitlines():
+        h = seq.accept(_is_heading(ln))
+        if h:
+            out.append([h[0], h[1], []])
+        out[-1][2].append(ln)
+    return [(n, t, "\n".join(ls)) for n, t, ls in out if ls]
 
 
 def _page_kind(text: str, idx: int) -> str:

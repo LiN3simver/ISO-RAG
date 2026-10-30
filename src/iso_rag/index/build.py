@@ -27,6 +27,7 @@ from .store import Writer, activate
 META_FILE = PDF_DIR / "metadata.jsonl"
 # 檔名開頭的文件編號：「SOP-QA-001 樣品保存作業規範.pdf」「QP0101_文件管制程序.pdf」
 _NO_RE = re.compile(r"^([A-Za-z]{1,6}(?:[-_]?[A-Za-z0-9]{1,6}){1,4})(?=[\s_]|$)")
+CLAUSE_MIN = 8        # 條文級向量：短於這麼多字的條文（只有標題的空條）不算
 
 
 class EmbedCache:
@@ -133,10 +134,21 @@ def _write(w: Writer, build_id: str, t0: float, log) -> dict:
         stats["embedded_new"] += new
         stats["pages"] += len(pages_of[sha])
         w.add_doc(d, pdf_path=str(p), pdf_sha=sha, pages=len(pages_of[sha]))
-        for r, v in zip(rows, vecs):
-            w.add_chunk(d["doc_no"], *r, vec=v,
-                        pdf_sha=None if r[0] == "meta" else sha, pdf_path=None if r[0] == "meta" else str(p))
+        # 條文級向量：本文段落依條文標題切開，每條另算一個向量（同一個快取），檢索時取 MaxSim（store.Reader.dense）
+        blocks = [[(num, t) for num, _, t in chunker.clause_blocks(r[5], r[4]) if len(t.strip()) >= CLAUSE_MIN]
+                  if r[0] == "body" else [] for r in rows]
+        flat = [t for bs in blocks for _, t in bs]
+        bvecs, bnew = cache.encode(flat) if flat else (np.zeros((0, 1)), 0)
+        stats["embedded_new"] += bnew
+        bi = 0
+        for r, v, bs in zip(rows, vecs, blocks):
+            cid = w.add_chunk(d["doc_no"], *r, vec=v,
+                              pdf_sha=None if r[0] == "meta" else sha, pdf_path=None if r[0] == "meta" else str(p))
             stats["chunks"] += 1
+            for num, _ in bs:
+                w.add_clause(cid, num, bvecs[bi])
+                bi += 1
+            stats["clauses"] = stats.get("clauses", 0) + len(bs)
         log(f"  {d['doc_no']} chunks={len(rows):3} pages={len(pages_of[sha]):3} new_vec={new}")
     stats["seconds"] = round(time.monotonic() - t0, 1)
     w.manifest(build_id=build_id, built_at=dt.datetime.now().isoformat(timespec="seconds"),

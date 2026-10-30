@@ -71,11 +71,12 @@ def extract_page(pdf: Path, digest: str, page: int, log=None) -> dict:
     else:
         p = ocr.ocr_page(str(pdf), page)
         img = _rotated(ocr.render(str(pdf), page), p.rotation)
-        words = p.words + ocr.filled_marks(img, [(w.x0, w.y0, w.x1, w.y1) for w in p.words])
+        marks = ocr.filled_marks(img, [(w.x0, w.y0, w.x1, w.y1) for w in p.words])
+        words, opts = ocr.option_marks(img, p.words + marks)
         rec = {"page": page + 1, "source": "ocr", "rotation": p.rotation,
                "width": p.width, "height": p.height,
                "text": ocr.page_text(words), "words": [asdict(x) for x in words],
-               "marks": len(words) - len(p.words)}
+               "marks": len(marks), "options": opts, "options_v": ocr.OPTIONS_V}
     if why != "short":
         rec["layer_check"] = why             # 有文字層但沒採用：記下原因
     rec["seconds"] = round(time.monotonic() - t0, 2)
@@ -92,6 +93,8 @@ def upgrade(pdf: Path, page: int, rec: dict) -> dict:
             if k in rec:
                 new[k] = rec[k]
         return new
+    if rec.get("source") == "ocr" and rec.get("options_v") != ocr.OPTIONS_V:
+        rec = _add_options(pdf, page, rec)
     if rec.get("source") == "ocr" and rec.get("tables_v") != _tables_v():
         from ..learn import adaptive
         from dataclasses import fields
@@ -111,6 +114,35 @@ def upgrade(pdf: Path, page: int, rec: dict) -> dict:
             new["text"] = lines
         return new
     return rec
+
+
+def _add_options(pdf: Path, page: int, rec: dict) -> dict:
+    """既有 OCR 快取補上選項控件 ◉○■□（ocr.option_marks，不重跑 OCR）。
+    文字只換掉受影響的行（其他策略合併進來的行照留）；字框變了，表格版要重做（tables_v 清掉）。"""
+    import difflib
+    from dataclasses import fields
+    words = [ocr.Word(**{f.name: w[f.name] for f in fields(ocr.Word)}) for w in rec["words"]]
+    img = _rotated(ocr.render(str(pdf), page), rec.get("rotation", 0))
+    new_words, n = ocr.option_marks(img, words)
+    new = {**rec, "options": n, "options_v": ocr.OPTIONS_V}
+    if not n:
+        return new
+    old_l, new_l = ocr.page_text(words).splitlines(), ocr.page_text(new_words).splitlines()
+    lines = rec.get("text_lines", rec["text"]).splitlines()
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_l, new_l, autojunk=False).get_opcodes():
+        if op != "replace":
+            continue
+        blk = old_l[i1:i2]
+        for k in range(len(lines) - len(blk) + 1):
+            if lines[k:k + len(blk)] == blk:
+                lines[k:k + len(blk)] = new_l[j1:j2]
+                break
+    new["words"] = [asdict(w) for w in new_words]
+    new["text_lines" if "text_lines" in rec else "text"] = "\n".join(lines)
+    if "text_chosen" in rec:
+        new["text_chosen"] = "\n".join(new_l)
+    new["tables_v"] = None
+    return new
 
 
 def _check_layer(text: str) -> tuple[bool, str]:

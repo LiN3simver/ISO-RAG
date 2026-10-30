@@ -47,18 +47,20 @@ def _client() -> anthropic.Anthropic:
                                timeout=TIMEOUT, max_retries=0)
 
 
-def _with_policy(system: str, user: str, max_tokens: int) -> str:
+def _with_policy(system: str, user: str, max_tokens: int, temperature: float | None = None) -> str:
     digest = hashlib.sha256(json.dumps(
-        {"model": MODEL, "system": system, "max_tokens": max_tokens},
+        {"model": MODEL, "system": system, "max_tokens": max_tokens, "temperature": temperature},
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     return f"[request-policy:{digest}]（設定識別碼，回答請勿引用）\n{user}"
 
 
-def _run(system: str, user: str, max_tokens: int, closer: list) -> LLMResult:
+def _run(system: str, user: str, max_tokens: int, closer: list, temperature: float | None = None) -> LLMResult:
     t0 = time.monotonic()
+    # temperature 經 extra_body 送給 gateway（SDK 的 stream() 不收這個參數）
+    extra = {"extra_body": {"temperature": temperature}} if temperature is not None else {}
     with _client().messages.stream(
         model=MODEL, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": _with_policy(system, user, max_tokens)}],
+        messages=[{"role": "user", "content": _with_policy(system, user, max_tokens, temperature)}], **extra,
     ) as stream:
         closer.append(stream)
         text = "".join(stream.text_stream)
@@ -75,15 +77,17 @@ def _run(system: str, user: str, max_tokens: int, closer: list) -> LLMResult:
 
 
 def complete(system: str, user: str, *, max_tokens: int = MAX_TOKENS,
-             timeout: float = TIMEOUT, on_wait=None, heartbeat: float = 10.0) -> LLMResult:
+             timeout: float = TIMEOUT, on_wait=None, heartbeat: float = 10.0,
+             temperature: float | None = None) -> LLMResult:
     """要一則完整回答；超過 timeout 秒就中止串流並丟 TimeoutError。
-    on_wait(已等秒數) 每 heartbeat 秒呼叫一次（給 SSE 送「還在等」的訊號）。"""
+    on_wait(已等秒數) 每 heartbeat 秒呼叫一次（給 SSE 送「還在等」的訊號）。
+    temperature：None = gateway 預設（隨機取樣）；0 = 同一個請求每次一樣。"""
     box: queue.Queue = queue.Queue(maxsize=1)
     closer: list = []
 
     def work():
         try:
-            box.put(("ok", _run(system, user, max_tokens, closer)))
+            box.put(("ok", _run(system, user, max_tokens, closer, temperature)))
         except BaseException as e:  # noqa: BLE001
             box.put(("err", e))
 

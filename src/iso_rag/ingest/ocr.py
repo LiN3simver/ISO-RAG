@@ -172,3 +172,146 @@ def filled_marks(img: np.ndarray, boxes_pt: list[tuple[float, float, float, floa
             continue
         out.append(Word(x / s, y / s, (x + w) / s, (y + h) / s, MARK, 1.0))
     return out
+
+
+# ---------------------------------------------------------------- 選項控件（電子表單的單選鈕／勾選框）
+OPTIONS_V = 1
+OPTION = {("o", True): "◉", ("o", False): "○", ("s", True): "■", ("s", False): "□"}
+_OPTION_CHARS = set("○◯◎●◉□☐■☑☒✓✔")       # OCR 對控件的各種讀法，拆詞時一律換成偵測結果
+
+
+def _controls(img: np.ndarray, dpi: int) -> list[tuple[int, int, int, int, str, bool]]:
+    """影像上的選項控件 [(x0, y0, x1, y1 像素, 'o' 圓 / 's' 方, 有沒有勾)]。
+
+    電子表單截圖的「◉新增 ○修改 ○取消」：OCR 會把控件吞掉或讀成雜字，變成「新增修改取消」，
+    問「勾的是哪個」就無從回答。控件的判斷全靠幾何形狀：
+      - 邊長 1.6~4.5 mm、外框圍起的形狀（圓的填滿率 ≈ 0.785、方 ≈ 1），框線與中心之間留白；
+      - 同一列至少兩個同形同大小才算（選項成組出現，單獨的「口」字不算）；
+      - 勾選的那顆常是藍底、空隙不白，改認「與同組空心控件同形同大小、中心有墨水、轉 180 度不變」。
+    """
+    import cv2
+
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((gray < 225).astype(np.uint8), connectivity=8)
+    px = dpi / 25.4
+    lo, hi = 1.6 * px, 4.5 * px
+    k3 = np.ones((3, 3), np.uint8)
+    hollow, solid = [], []
+    for i in range(1, n):
+        x, y, w, h, _a = stats[i]
+        if not (lo <= w <= hi and lo <= h <= hi and 0.85 <= w / h <= 1.18):
+            continue
+        comp = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
+        comp = cv2.morphologyEx(np.pad(comp, 2), cv2.MORPH_CLOSE, k3)[2:-2, 2:-2]   # 淡灰外框有斷點
+        ff = np.pad(1 - comp, 1, constant_values=1)
+        cv2.floodFill(ff, None, (0, 0), 2)
+        filled = (ff[1:-1, 1:-1] != 2).astype(np.uint8)        # 外框圍起來的區域
+        fa = float(filled.mean())
+        if fa < 0.7:
+            continue
+        s = min(w, h)
+        a1 = cv2.erode(filled, k3, iterations=max(int(0.13 * s), 2)).astype(bool)
+        a2 = cv2.erode(filled, k3, iterations=max(int(0.27 * s), 3)).astype(bool)
+        gap = a1 & ~a2
+        if not a2.any() or not gap.any():
+            continue
+        g = gray[y:y + h, x:x + w]
+        center = float((g[a2] < 160).mean())
+        if 0.1 <= center < (0.6 if fa <= 0.9 else 0.5):
+            continue           # 中心只有一部分墨水：圈號數字、掃描雜點，不是空框也不是實心點
+        band = gray[y + 2:y + h - 2] < 160
+        if _blank(band, x - 1, -1, s) < 0.5 * s or _blank(band, x + w, 1, s) < 0.2 * s:
+            continue           # 控件左右要留白；英文字母 o/D/e 總有一邊緊貼別的字
+        c = (x, y, x + w, y + h, "s" if fa > 0.9 else "o", fa, center)
+        if np.median(g[gap]) >= 200:
+            hollow.append(c)
+        elif np.abs(g.astype(np.float32) - g[::-1, ::-1]).mean() < 0.12 * 255:
+            solid.append(c)        # 圓點、實心方塊轉 180 度不變；字不會
+
+    def mates(c, pool):
+        sz, cy = c[3] - c[1], (c[1] + c[3]) / 2
+        return [d for d in pool if d is not c and d[4] == c[4] and abs((d[1] + d[3]) / 2 - cy) < 0.3 * sz
+                and abs((d[3] - d[1]) - sz) <= 0.1 * sz + 1 and abs(d[5] - c[5]) <= 0.04]
+
+    keep = [c for c in hollow if mates(c, hollow)]
+    out = [(*c[:5], c[6] >= 0.1) for c in keep]
+    out += [(*c[:5], True) for c in solid if c[6] >= 0.1 and mates(c, keep)]
+    return out
+
+
+def _blank(band: np.ndarray, start: int, step: int, limit: int) -> int:
+    """從 start 往 step 方向數連續幾欄沒有墨水（最多 limit；碰到頁緣算全白）。"""
+    for n in range(limit):
+        x = start + n * step
+        if not 0 <= x < band.shape[1]:
+            return limit
+        if band[:, x].any():
+            return n
+    return limit
+
+
+def option_marks(img: np.ndarray, words: list[Word], dpi: int = DPI) -> tuple[list[Word], int]:
+    """把選項控件補回文字：「新增修改取消 ○停用」→「◉新增 ○修改 ○取消 ○停用」。回傳 (新 words, 控件數)。
+
+    控件常落在 OCR 合併的詞框裡，要把詞拆開：依影像上控件之間各段的墨水寬度估字數，切在最近的字界。
+    """
+    s = dpi / 72.0
+    ctl = sorted(((x0 / s, y0 / s, x1 / s, y1 / s, OPTION[shape, on])
+                  for x0, y0, x1, y1, shape, on in _controls(img, dpi)), key=lambda c: c[0])
+    ctl = [c for c in ctl if _line_sized(c, words)]
+    if not ctl:
+        return words, 0
+    gray = img.mean(axis=2) if img.ndim == 3 else img
+    used: set[int] = set()
+    out: list[Word] = []
+    for w in words:
+        inside = [i for i, c in enumerate(ctl) if i not in used
+                  and w.x0 <= (c[0] + c[2]) / 2 <= w.x1 and w.y0 <= (c[1] + c[3]) / 2 <= w.y1]
+        if not inside:
+            out.append(w)
+            continue
+        used.update(inside)
+        out += _split(w, [ctl[i] for i in inside], gray, s)
+    out += [Word(c[0], c[1], c[2], c[3], c[4], 1.0) for i, c in enumerate(ctl) if i not in used]
+    return out, len(ctl)
+
+
+def _line_sized(c: tuple, words: list[Word]) -> bool:
+    """控件跟所在那行字一樣高、垂直置中。字的部件（「品」下面的口）只有半個字高、「。」貼底線，
+    同列又同大小，群組條件擋不掉，靠這一關排除。"""
+    h, cy = c[3] - c[1], (c[1] + c[3]) / 2
+    row = [w for w in words if w.y0 <= cy <= w.y1 and w.x1 > c[0] and w.x0 < c[2] + 4 * h]   # 包住它或右邊的標籤
+    if not row:
+        return False
+    w = min(row, key=lambda w: max(w.x0 - c[2], 0))
+    return h >= 0.55 * (w.y1 - w.y0) and abs(cy - (w.y0 + w.y1) / 2) <= 0.2 * (w.y1 - w.y0)
+
+
+def _split(w: Word, cs: list[tuple], gray: np.ndarray, s: float) -> list[Word]:
+    text = "".join(ch for ch in w.text if ch not in _OPTION_CHARS and not ch.isspace())
+    if text in ("O", "o", "0"):                     # 整個詞就是控件本身被讀成字母
+        text = ""
+    wt = [1.0 if unicodedata.east_asian_width(ch) in "WF" else 0.5 for ch in text]
+    # 控件之間每一段的墨水寬度（像素）
+    y0, y1 = int(w.y0 * s), int(w.y1 * s)
+    edges = [w.x0] + [v for c in cs for v in (c[0], c[2])] + [w.x1]
+    ink = []
+    for a, b in zip(edges[::2], edges[1::2]):
+        cols = np.flatnonzero((gray[y0:y1, int(a * s) + 2:max(int(b * s) - 2, int(a * s) + 2)] < 160).any(axis=0))
+        ink.append(float(cols[-1] - cols[0] + 1) if cols.size else 0.0)
+    total = sum(ink)
+    cum_w = np.cumsum([0.0] + wt)                    # 字界（以字寬權重計）
+    cuts, acc = [], 0.0
+    for v in ink[:-1]:
+        acc += v
+        target = acc / total * cum_w[-1] if total else 0.0
+        cut = int(np.argmin(np.abs(cum_w - target)))
+        cuts.append(max(cut, cuts[-1] if cuts else 0))
+    bounds = [0] + cuts + [len(text)]
+    out = []
+    if bounds[1] > 0:
+        out.append(Word(w.x0, w.y0, cs[0][0], w.y1, text[:bounds[1]], w.score))
+    for k, c in enumerate(cs):
+        x1 = cs[k + 1][0] if k + 1 < len(cs) else w.x1
+        out.append(Word(c[0], w.y0, x1, w.y1, c[4] + text[bounds[k + 1]:bounds[k + 2]], w.score))
+    return out

@@ -144,6 +144,25 @@ def test_filled_marks_finds_checkboxes_not_text_or_photos():
     assert marks[0].text == ocr.MARK
 
 
+def test_option_marks_restores_radio_buttons_inside_ocr_word():
+    import cv2
+    from iso_rag.ingest import ocr
+    img = np.full((300, 700, 3), 255, np.uint8)
+    for x in (100, 140, 240, 280, 370, 410):              # 「類型」「新增」「修改」六個字（墨水塊）
+        img[105:135, x:x + 32] = 0
+    img[112:116, 180:184] = img[124:128, 180:184] = 0     # 半形冒號
+    cv2.circle(img, (215, 120), 13, (190, 200, 230), -1)  # 勾選的那顆：藍底（空隙不是白的）
+    cv2.circle(img, (215, 120), 13, (60, 90, 200), 3)
+    cv2.circle(img, (215, 120), 6, (30, 60, 180), -1)
+    cv2.circle(img, (345, 120), 13, (120, 120, 120), 3)   # 沒勾
+    cv2.rectangle(img, (500, 200), (530, 230), (0, 0, 0), 3)   # 單獨一個方框（像「口」）-> 不算
+    s = 72 / 300
+    words = [ocr.Word(95 * s, 100 * s, 450 * s, 140 * s, "類型:新增修改", 0.9)]
+    new, n = ocr.option_marks(img, words)
+    assert n == 2
+    assert ocr.page_text(new) == "類型: ◉新增 ○修改"
+
+
 def test_table_docs_are_not_split_by_fake_clauses():
     from iso_rag.ingest import chunker
     form = [{"page": 1, "text": "進料/制程檢驗規範\n序號 規格尺寸 規格上限 規格下限\n"

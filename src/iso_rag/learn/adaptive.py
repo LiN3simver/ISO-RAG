@@ -319,8 +319,8 @@ def ocr_image(img: np.ndarray, rt: Runtime, *, sha: str, page: int, doc: str, pd
             + " ".join(f"{a.variant}={a.quality:.3f}/{a.seconds:.0f}s" for a in attempts) + f" -> {best.variant}")
     # 表格勾選記號（品質估計之後才加，模型特徵維持只看 OCR 本身的輸出）
     marks = ocr.filled_marks(img_r, [(w.x0, w.y0, w.x1, w.y1) for w in best.words], dpi)
-    words = best.words + marks
-    chosen = ocr.page_text(words) if marks else best.text
+    words, opts = ocr.option_marks(img_r, best.words + marks, dpi)      # 電子表單的 ◉○■□
+    chosen = ocr.page_text(words) if marks or opts else best.text
     # words 維持選中策略的框（座標要一致）；只有 text 合併其他策略漏掉的行
     text, added = merge_text(chosen, [a.text for a in attempts if a is not best], rt.model.lm)
     extra = {"merged": len(added), "text_chosen": chosen} if added else {"merged": 0}
@@ -330,7 +330,7 @@ def ocr_image(img: np.ndarray, rt: Runtime, *, sha: str, page: int, doc: str, pd
     extra.update(tables=tt["tables"], tables_v=TABLES_V)
     return {"page": page, "source": "ocr", "rotation": rot, "width": best.width, "height": best.height,
             "text": text, "words": [asdict(w) for w in words], **extra,
-            "marks": len(marks), "variant": best.variant,
+            "marks": len(marks), "options": opts, "options_v": ocr.OPTIONS_V, "variant": best.variant,
             "quality": round(best.quality, 4), "profile": prof.id, "new_layout": created, "suspect": suspect,
             "tried": [{"variant": a.variant, "quality": round(a.quality, 4), "seconds": round(a.seconds, 2)}
                       for a in attempts], **({"ctx": why} if why else {}),

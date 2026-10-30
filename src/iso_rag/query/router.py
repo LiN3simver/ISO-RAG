@@ -66,6 +66,8 @@ class Analysis:
     focus_docs: list[str] = field(default_factory=list)     # 問題明確指向的文件（只檢索這些）
     focus_term: str = ""
     focused: bool = False                                    # search() 是否真的鎖定了焦點文件
+    sections: list = field(default_factory=list)            # search() 判定問題問的整個章節（search.Section）
+    tables: list = field(default_factory=list)              # search() 判定問題問的整張長表（search.Table）
 
 
 # ---------------------------------------------------------------- 焦點文件
@@ -210,7 +212,31 @@ def analyze(q: str, idx: Reader) -> Analysis:
                     rest = rest.replace(part, "")
         rest = FILLER_RE.sub("", rest)
         a.attr_only = len(rest) <= 3
+        if a.attr_only and _pdf_disagrees(q, idx, a):
+            a.attr_only = False
     return a
+
+
+def _pdf_disagrees(q: str, idx: Reader, a: Analysis) -> bool:
+    """屬性題自我核對：問句裡的欄位詞（「版次」「生效日期」）也是這份 PDF 裡的欄位標籤，屬性值卻不在同一段
+    -> 屬性資料與 PDF 不一致（常見於屬性沒跟著改版更新），改交給檢索＋LLM，以 PDF 為準。
+    看的是資料對不對得上，不是問句怎麼問。"""
+    words = {m.group(0) for pat, _, _ in ATTRS for m in [re.search(pat, q, re.I)] if m and len(m.group(0)) >= 2}
+    for n in a.doc_nos:
+        d = idx.docs[n]
+        if not d.get("pdf_path"):
+            continue
+        vals = {str(v).split()[0] for f, _ in a.attrs if (v := d.get(f)) and str(v).strip()}
+        for c in idx.chunks.values():
+            if c.doc_no != n or c.kind == "meta":
+                continue
+            for w in words:
+                # 欄位標籤：表格的一格（「版次 | …」），或後面接冒號（「生效日期：」）；一般用語不算
+                label = re.search(rf"(?m)(?:^|[|｜])\s*{re.escape(w)}\s*(?:[|｜:：]|$)|{re.escape(w)}\s*[:：]", c.text)
+                if label and not any(re.search(rf"(?<![0-9A-Za-z]){re.escape(v)}(?![0-9A-Za-z])", c.text)
+                                     for v in vals):
+                    return True
+    return False
 
 
 def _list_explains(q: str) -> bool:

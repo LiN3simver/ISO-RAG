@@ -29,6 +29,9 @@ CREATE TABLE chunks (
   section TEXT, clause TEXT, text TEXT, embed_text TEXT, vec BLOB,
   pdf_sha TEXT, pdf_path TEXT);          -- 段落出自哪個 PDF（一份文件可能掛好幾個 PDF：本文 + 附件表單）
 CREATE INDEX chunks_doc ON chunks(doc_no);
+-- 條文級向量：本文段落依條文標題切開（chunker.clause_blocks），每條一個向量，對回所屬段落
+CREATE TABLE clauses (chunk_id INTEGER, clause TEXT, vec BLOB);
+CREATE INDEX clauses_chunk ON clauses(chunk_id);
 CREATE VIRTUAL TABLE chunks_fts USING fts5(tokens, content='', tokenize='unicode61 remove_diacritics 0');
 """
 
@@ -72,6 +75,9 @@ class Writer:
         cid = cur.lastrowid
         self.db.execute("INSERT INTO chunks_fts (rowid, tokens) VALUES (?, ?)", (cid, textnorm.fts_text(embed_text)))
         return cid
+
+    def add_clause(self, chunk_id: int, clause: str, vec: np.ndarray):
+        self.db.execute("INSERT INTO clauses VALUES (?,?,?)", (chunk_id, clause, vec.astype(np.float32).tobytes()))
 
     def commit(self):
         """寫完、關檔，但還不切換（build 成功才 activate）。"""
@@ -128,12 +134,26 @@ class Reader:
         self.chunks = {r[0]: ChunkRow(*r[:8], *r[9:]) for r in rows}
         self.ids = np.array([r[0] for r in rows], dtype=np.int64)
         self.mat = np.vstack([np.frombuffer(r[8], dtype=np.float32) for r in rows]) if rows else np.zeros((0, 1024), np.float32)
+        crows = self.db.execute("SELECT chunk_id, vec FROM clauses").fetchall()
+        self.clause_ids = np.array([r[0] for r in crows], dtype=np.int64)
+        self.clause_mat = (np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in crows]) if crows
+                           else np.zeros((0, self.mat.shape[1]), np.float32))
+        pos = {int(c): i for i, c in enumerate(self.ids)}
+        self.clause_row = np.array([pos[int(c)] for c in self.clause_ids], dtype=np.int64)   # 條文 -> 段落列
 
     def close(self):
         self.db.close()
 
-    def dense(self, qvec: np.ndarray, k: int, allow: set[int] | None = None) -> list[tuple[int, float]]:
+    def dense(self, qvec: np.ndarray, k: int, allow: set[int] | None = None,
+              clauses: bool = True) -> list[tuple[int, float]]:
+        """段落分數 = max(段落向量, 段落裡最像的一條條文向量)（多向量 MaxSim）。
+        短條文（「5.1.4 樣品需求數量：一般≦10pcs」）跟同段其他條文平均成一個向量時會被稀釋，
+        換句話問（「一次可以申請幾個」）就排不上來；條文向量讓它以自己的語意被比對。clauses=False：只看段落向量。"""
         sims = self.mat @ qvec
+        if clauses and len(self.clause_ids):
+            best = np.full(len(sims), -1.0, np.float32)
+            np.maximum.at(best, self.clause_row, self.clause_mat @ qvec)
+            sims = np.maximum(sims, best)
         order = np.argsort(-sims)
         out = []
         for i in order:
